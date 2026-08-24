@@ -28,8 +28,8 @@ USER_DATA = {}
 THUMB_PATH = "thumb.jpg"
 TIMEOUT = 30
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://www.adda247.com",
@@ -49,7 +49,7 @@ def safe_get(obj, *keys, default=None):
         return default
 
 async def download_thumbnail():
-    if not os.path.exists(THUMB_PATH) and config.THUMB_URL:
+    if not os.path.exists(THUMB_PATH) and getattr(config, 'THUMB_URL', None):
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(config.THUMB_URL)
@@ -63,7 +63,7 @@ async def download_thumbnail():
     return THUMB_PATH if os.path.exists(THUMB_PATH) else None
 
 async def make_request(url, headers=None, method="GET", json_data=None, timeout=TIMEOUT):
-    req_headers = DEFAULT_HEADERS.copy()
+    req_headers = BASE_HEADERS.copy()
     if headers:
         req_headers.update(headers)
 
@@ -77,7 +77,7 @@ async def make_request(url, headers=None, method="GET", json_data=None, timeout=
             if response.status_code == 200:
                 return response.json()
             else:
-                logger.warning(f"Endpoint {url} returned {response.status_code}")
+                logger.warning(f"Endpoint {url} returned status: {response.status_code}")
                 return None
     except Exception as e:
         logger.error(f"Request Error for {url}: {e}")
@@ -178,7 +178,6 @@ async def handle_user_input(client, message: Message):
         await forward_to_log(message, "Adda247")
 
         email, password = message.text.split("*", 1)
-        auth_headers = {}
 
         login_data = {
             "email": email.strip(),
@@ -188,7 +187,6 @@ async def handle_user_input(client, message: Message):
 
         login_response = await make_request(
             "https://userapi.adda247.com/login?src=aweb",
-            headers=auth_headers,
             method="POST",
             json_data=login_data
         )
@@ -198,32 +196,41 @@ async def handle_user_input(client, message: Message):
             del USER_DATA[chat_id]
             return
 
-        jwt = safe_get(login_response, "jwtToken")
+        jwt = safe_get(login_response, "jwtToken") or safe_get(login_response, "data", "jwtToken")
         if not jwt:
             await status_msg.edit_text("❌ <b>Login Failed:</b> Invalid Credentials.")
             del USER_DATA[chat_id]
             return
 
-        # Crucial Token Assignment
-        auth_headers["X-Jwt-Token"] = jwt
-        auth_headers["jwtToken"] = jwt
+        # Multi-header Token Injection to fix HTTP 400
+        auth_headers = {
+            "X-Jwt-Token": jwt,
+            "jwtToken": jwt,
+            "Authorization": f"Bearer {jwt}",
+            "token": jwt
+        }
 
         await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching your purchased batches...", parse_mode=ParseMode.HTML)
 
-        # Fetch Batches (Using Compatible Endpoints)
-        packages_response = await make_request(
+        # Attempting Multiple Purchase Endpoints
+        packages = []
+        fetch_urls = [
+            "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=50&src=aweb",
             "https://store.adda247.com/api/v1/my/purchase?src=aweb",
-            headers=auth_headers
-        )
+            "https://store.adda247.com/api/v1/user/purchased/packages?src=aweb"
+        ]
 
-        packages = safe_get(packages_response, "data", default=[])
-        
-        if not packages:
-            v2_packages = await make_request(
-                "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=50&src=aweb",
-                headers=auth_headers
-            )
-            packages = safe_get(v2_packages, "data", default=[])
+        for url in fetch_urls:
+            packages_response = await make_request(url, headers=auth_headers)
+            if packages_response:
+                fetched = (
+                    safe_get(packages_response, "data", "packages") or 
+                    safe_get(packages_response, "data") or 
+                    safe_get(packages_response, "packages")
+                )
+                if fetched and isinstance(fetched, list):
+                    packages = fetched
+                    break
 
         if not packages:
             await status_msg.edit_text("❌ <b>No Packages Found:</b> Account par koi active batch nahi mila.")
@@ -238,7 +245,7 @@ async def handle_user_input(client, message: Message):
 
         list_text = "📚 <b>SELECT YOUR BATCH</b> 📚\n\n"
         for idx, pkg in enumerate(packages, start=1):
-            title = safe_get(pkg, "title", default="Untitled Batch")
+            title = safe_get(pkg, "title") or safe_get(pkg, "packageName") or safe_get(pkg, "name", default="Untitled Batch")
             list_text += f"<b>{idx}.</b> {title}\n"
 
         list_text += "\n👇 <b>Reply with the Index Number of the batch (e.g., 1 or 2):</b>"
@@ -260,7 +267,7 @@ async def handle_user_input(client, message: Message):
 
         selected_package = packages[selected_index]
         package_id = safe_get(selected_package, "packageId") or safe_get(selected_package, "id")
-        package_title = safe_get(selected_package, "title", default="Untitled").replace('|', '_').replace('/', '_')
+        package_title = (safe_get(selected_package, "title") or safe_get(selected_package, "packageName") or safe_get(selected_package, "name", default="Untitled")).replace('|', '_').replace('/', '_')
 
         del USER_DATA[chat_id]
 
@@ -299,6 +306,7 @@ async def handle_user_input(client, message: Message):
         if os.path.exists(file_name) and os.path.getsize(file_name) > 0:
             elapsed = time.time() - start_time
             user_mention = message.from_user.mention
+            bot_text = getattr(config, 'BOT_TEXT', 'Adda247 Extractor')
             caption = (
                 "🎓 <b>COURSE EXTRACTED</b> 🎓\n\n"
                 f"📱 <b>APP:</b> ADDA 247\n"
@@ -308,7 +316,7 @@ async def handle_user_input(client, message: Message):
                 f"📊 <b>CONTENT STATS</b>\n"
                 f"└─ 📁 Total Items: {total_items}\n\n"
                 f"🚀 <b>Extracted by:</b> {user_mention}\n\n"
-                f"<code>╾───• {config.BOT_TEXT} •───╼</code>"
+                f"<code>╾───• {bot_text} •───╼</code>"
             )
 
             await message.reply_document(
