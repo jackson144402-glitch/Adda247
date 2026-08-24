@@ -2,5 +2,4 @@ pyrogram
 tgcrypto
 httpx
 pytz
-yrogram==2.0.106
 python-dotenv
