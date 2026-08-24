@@ -64,27 +64,6 @@ async def download_thumbnail():
             return None
     return THUMB_PATH if os.path.exists(THUMB_PATH) else None
 
-async def make_request(url, headers=None, method="GET", json_data=None, timeout=TIMEOUT):
-    req_headers = BASE_HEADERS.copy()
-    if headers:
-        req_headers.update(headers)
-
-    try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            if method == "GET":
-                response = await client.get(url, headers=req_headers, timeout=timeout)
-            else:
-                response = await client.post(url, headers=req_headers, json=json_data, timeout=timeout)
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.warning(f"Endpoint {url} returned status: {response.status_code}")
-                return None
-    except Exception as e:
-        logger.error(f"Request Error for {url}: {e}")
-        return None
-
 async def forward_to_log(message: Message, platform: str):
     if getattr(config, "PREMIUM_LOGS", None):
         try:
@@ -98,7 +77,7 @@ async def forward_to_log(message: Message, platform: str):
         except Exception:
             pass
 
-async def scrape_package_items(pkg_id, auth_headers, file_handle):
+async def scrape_package_items(client, pkg_id, auth_headers, file_handle):
     items_count = 0
     endpoints = [
         (f"https://store.adda247.com/api/v1/my/purchase/OLC/{pkg_id}?src=aweb", "onlineClasses"),
@@ -108,8 +87,13 @@ async def scrape_package_items(pkg_id, auth_headers, file_handle):
     ]
 
     for endpoint, key in endpoints:
-        resp = await make_request(endpoint, headers=auth_headers)
-        if not resp:
+        try:
+            resp_raw = await client.get(endpoint, headers=auth_headers, timeout=TIMEOUT)
+            if resp_raw.status_code != 200:
+                continue
+            resp = resp_raw.json()
+        except Exception as e:
+            logger.error(f"Scrape Error for {endpoint}: {e}")
             continue
 
         raw_data = safe_get(resp, "data")
@@ -163,7 +147,7 @@ async def cancel_handler(client, message: Message):
         await message.reply_text("Koi active process nahi chal rha.")
 
 @app.on_message(filters.text & filters.private & ~filters.command(["adda", "start", "cancel"]))
-async def handle_user_input(client, message: Message):
+async def handle_user_input(bot_client, message: Message):
     chat_id = message.chat.id
     user_session = USER_DATA.get(chat_id)
 
@@ -181,93 +165,89 @@ async def handle_user_input(client, message: Message):
 
         email, password = message.text.split("*", 1)
 
-        # Updated Login Payloads
-        login_response = None
-        login_data_variants = [
-            {"email": email.strip(), "password": password.strip(), "providerName": "email"},
-            {"email": email.strip(), "sec": password.strip(), "providerName": "email"},
-            {"username": email.strip(), "password": password.strip()}
-        ]
-
-        login_urls = [
-            "https://userapi.adda247.com/login?src=aweb",
-            "https://userapi.adda247.com/v1/login?src=aweb"
-        ]
-
-        for url in login_urls:
-            for payload in login_data_variants:
-                login_response = await make_request(url, method="POST", json_data=payload)
-                if login_response and (safe_get(login_response, "jwtToken") or safe_get(login_response, "data", "jwtToken")):
-                    break
-            if login_response and (safe_get(login_response, "jwtToken") or safe_get(login_response, "data", "jwtToken")):
-                break
-
-        if not login_response:
-            await status_msg.edit_text("❌ <b>Login Failed:</b> Credentials galat hain ya Server issue hai.")
-            del USER_DATA[chat_id]
-            return
-
-        jwt = safe_get(login_response, "jwtToken") or safe_get(login_response, "data", "jwtToken")
-        user_id = safe_get(login_response, "userId") or safe_get(login_response, "data", "userId") or safe_get(login_response, "user", "id")
-
-        if not jwt:
-            await status_msg.edit_text("❌ <b>Login Failed:</b> Token receive nahi hua.")
-            del USER_DATA[chat_id]
-            return
-
-        auth_headers = {
-            "X-Jwt-Token": jwt,
-            "x-access-token": jwt,
-            "Authorization": f"Bearer {jwt}",
-            "jwtToken": jwt,
-            "token": jwt
-        }
-        
-        if user_id:
-            auth_headers["userId"] = str(user_id)
-            auth_headers["x-user-id"] = str(user_id)
-
-        await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching purchased courses...", parse_mode=ParseMode.HTML)
-
-        packages = []
-        uid_param = f"&userId={user_id}" if user_id else ""
-        
-        fetch_urls = [
-            f"https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb{uid_param}",
-            f"https://store.adda247.com/api/v1/my/purchase?src=aweb{uid_param}"
-        ]
-
-        for url in fetch_urls:
-            packages_response = await make_request(url, headers=auth_headers)
-            if packages_response:
-                fetched = (
-                    safe_get(packages_response, "data", "packages") or 
-                    safe_get(packages_response, "data", "items") or
-                    safe_get(packages_response, "data") or 
-                    safe_get(packages_response, "packages")
-                )
-                if fetched and isinstance(fetched, list):
-                    packages = fetched
-                    break
-
-        if not packages:
-            await status_msg.edit_text("❌ <b>No Packages Found:</b> Account par koi active batch nahi mila.")
-            del USER_DATA[chat_id]
-            return
-
-        USER_DATA[chat_id] = {
-            "state": "WAITING_BATCH_SELECTION",
-            "headers": auth_headers,
-            "packages": packages
+        login_payload = {
+            "email": email.strip(),
+            "providerName": "email",
+            "sec": password.strip()
         }
 
-        list_text = "📚 <b>SELECT YOUR BATCH</b> 📚\n\n"
-        for idx, pkg in enumerate(packages, start=1):
-            title = safe_get(pkg, "title") or safe_get(pkg, "packageName") or safe_get(pkg, "name", default="Untitled Batch")
-            list_text += f"<b>{idx}.</b> {title}\n"
+        async with httpx.AsyncClient(headers=BASE_HEADERS, follow_redirects=True, timeout=TIMEOUT) as http_client:
+            login_resp = await http_client.post("https://userapi.adda247.com/login?src=aweb", json=login_payload)
+            
+            if login_resp.status_code != 200:
+                await status_msg.edit_text("❌ <b>Login Failed:</b> Credentials galat hain ya Auth Server down hai.")
+                del USER_DATA[chat_id]
+                return
 
-        list_text += "\n👇 <b>Reply with the Index Number of the batch (e.g., 1 or 2):</b>"
-        await status_msg.edit_text(list_text, parse_mode=ParseMode.HTML)
+            login_data = login_resp.json()
+            jwt = safe_get(login_data, "jwtToken") or safe_get(login_data, "data", "jwtToken")
+            user_id = safe_get(login_data, "userId") or safe_get(login_data, "data", "userId")
+
+            if not jwt:
+                await status_msg.edit_text("❌ <b>Login Failed:</b> JWT Token missing.")
+                del USER_DATA[chat_id]
+                return
+
+            # Injecting cookies & authorization headers into HTTP client session
+            http_client.cookies.set("jwtToken", jwt, domain="adda247.com")
+            http_client.cookies.set("token", jwt, domain="adda247.com")
+            
+            auth_headers = {
+                "X-Jwt-Token": jwt,
+                "x-access-token": jwt,
+                "Authorization": f"Bearer {jwt}",
+                "jwtToken": jwt,
+                "token": jwt
+            }
+            if user_id:
+                auth_headers["userId"] = str(user_id)
+                auth_headers["x-user-id"] = str(user_id)
+                http_client.cookies.set("userId", str(user_id), domain="adda247.com")
+
+            await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching purchased courses...", parse_mode=ParseMode.HTML)
+
+            packages = []
+            fetch_urls = [
+                "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb",
+                "https://store.adda247.com/api/v1/my/purchase?src=aweb"
+            ]
+
+            for url in fetch_urls:
+                try:
+                    res = await http_client.get(url, headers=auth_headers)
+                    if res.status_code == 200:
+                        res_json = res.json()
+                        fetched = (
+                            safe_get(res_json, "data", "packages") or 
+                            safe_get(res_json, "data", "items") or
+                            safe_get(res_json, "data") or 
+                            safe_get(res_json, "packages")
+                        )
+                        if fetched and isinstance(fetched, list):
+                            packages = fetched
+                            break
+                except Exception as e:
+                    logger.error(f"Error fetching package: {e}")
+
+            if not packages:
+                await status_msg.edit_text("❌ <b>No Packages Found:</b> Account par koi active batch nahi mila.")
+                del USER_DATA[chat_id]
+                return
+
+            USER_DATA[chat_id] = {
+                "state": "WAITING_BATCH_SELECTION",
+                "headers": auth_headers,
+                "jwt": jwt,
+                "packages": packages
+            }
+
+            list_text = "📚 <b>SELECT YOUR BATCH</b> 📚\n\n"
+            for idx, pkg in enumerate(packages, start=1):
+                title = safe_get(pkg, "title") or safe_get(pkg, "packageName") or safe_get(pkg, "name", default="Untitled Batch")
+                list_text += f"<b>{idx}.</b> {title}\n"
+
+            list_text += "\n👇 <b>Reply with the Index Number of the batch (e.g., 1 or 2):</b>"
+            await status_msg.edit_text(list_text, parse_mode=ParseMode.HTML)
 
     # STEP 2: Process Selected Batch Number
     elif user_session.get("state") == "WAITING_BATCH_SELECTION":
@@ -278,6 +258,7 @@ async def handle_user_input(client, message: Message):
         selected_index = int(message.text) - 1
         packages = user_session.get("packages", [])
         auth_headers = user_session.get("headers", {})
+        jwt = user_session.get("jwt", "")
 
         if selected_index < 0 or selected_index >= len(packages):
             await message.reply_text(f"❌ Invalid Choice! Enter a number between 1 and {len(packages)}.")
@@ -299,27 +280,34 @@ async def handle_user_input(client, message: Message):
         total_items = 0
         thumb_path = await download_thumbnail()
 
-        with open(file_name, "w", encoding='utf-8') as file:
-            total_items += await scrape_package_items(package_id, auth_headers, file)
+        async with httpx.AsyncClient(headers=BASE_HEADERS, follow_redirects=True, timeout=TIMEOUT) as http_client:
+            http_client.cookies.set("jwtToken", jwt, domain="adda247.com")
+            http_client.cookies.set("token", jwt, domain="adda247.com")
+            
+            with open(file_name, "w", encoding='utf-8') as file:
+                total_items += await scrape_package_items(http_client, package_id, auth_headers, file)
 
-            child_urls = [
-                f"https://store.adda247.com/api/v2/ppc/package/child?packageId={package_id}&pageNumber=0&pageSize=100&src=aweb",
-                f"https://store.adda247.com/api/v1/ppc/package/child?packageId={package_id}&src=aweb"
-            ]
+                child_urls = [
+                    f"https://store.adda247.com/api/v2/ppc/package/child?packageId={package_id}&pageNumber=0&pageSize=100&src=aweb",
+                    f"https://store.adda247.com/api/v1/ppc/package/child?packageId={package_id}&src=aweb"
+                ]
 
-            child_packages = []
-            for c_url in child_urls:
-                c_resp = await make_request(c_url, headers=auth_headers)
-                if c_resp:
-                    fetched = safe_get(c_resp, "data", "packages", default=[]) or safe_get(c_resp, "data", default=[])
-                    if fetched and isinstance(fetched, list):
-                        child_packages.extend(fetched)
-                        break
+                child_packages = []
+                for c_url in child_urls:
+                    try:
+                        c_resp = await http_client.get(c_url, headers=auth_headers)
+                        if c_resp.status_code == 200:
+                            fetched = safe_get(c_resp.json(), "data", "packages", default=[]) or safe_get(c_resp.json(), "data", default=[])
+                            if fetched and isinstance(fetched, list):
+                                child_packages.extend(fetched)
+                                break
+                    except Exception:
+                        pass
 
-            for child in child_packages:
-                child_id = safe_get(child, "packageId") or safe_get(child, "id")
-                if child_id:
-                    total_items += await scrape_package_items(child_id, auth_headers, file)
+                for child in child_packages:
+                    child_id = safe_get(child, "packageId") or safe_get(child, "id")
+                    if child_id:
+                        total_items += await scrape_package_items(http_client, child_id, auth_headers, file)
 
         if os.path.exists(file_name) and os.path.getsize(file_name) > 0:
             elapsed = time.time() - start_time
