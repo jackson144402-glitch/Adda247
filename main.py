@@ -29,7 +29,6 @@ USER_STATES = {}
 THUMB_PATH = "thumb.jpg"
 TIMEOUT = 30
 
-# Standard Headers to prevent 400 Bad Request errors
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -65,7 +64,6 @@ async def download_thumbnail():
     return THUMB_PATH if os.path.exists(THUMB_PATH) else None
 
 async def make_request(url, headers=None, method="GET", json_data=None, timeout=TIMEOUT):
-    """Safely handle HTTP requests with browser headers"""
     req_headers = DEFAULT_HEADERS.copy()
     if headers:
         req_headers.update(headers)
@@ -80,7 +78,6 @@ async def make_request(url, headers=None, method="GET", json_data=None, timeout=
             if response.status_code == 200:
                 return response.json()
             else:
-                logger.warning(f"API Endpoint {url} returned status {response.status_code}")
                 return None
     except Exception as e:
         logger.error(f"Request Error for {url}: {e}")
@@ -98,6 +95,44 @@ async def forward_to_log(message: Message, platform: str):
             await app.send_message(config.PREMIUM_LOGS, log_text, parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Failed to forward logs: {e}")
+
+async def scrape_package_items(pkg_id, auth_headers, file_handle):
+    """Deeply parses all video and pdf items for any given package ID"""
+    items_count = 0
+    endpoints = [
+        (f"https://store.adda247.com/api/v1/my/purchase/OLC/{pkg_id}?src=aweb", "onlineClasses"),
+        (f"https://store.adda247.com/api/v1/my/purchase/content/{pkg_id}?src=aweb", "contents"),
+        (f"https://store.adda247.com/api/v1/my/purchase/test/{pkg_id}?src=aweb", "tests"),
+        (f"https://store.adda247.com/api/v1/my/purchase/ebook/{pkg_id}?src=aweb", "ebooks")
+    ]
+
+    for endpoint, key in endpoints:
+        resp = await make_request(endpoint, headers=auth_headers)
+        if not resp:
+            continue
+
+        raw_data = safe_get(resp, "data")
+        items = safe_get(resp, "data", key, default=[]) if isinstance(raw_data, dict) else (raw_data if isinstance(raw_data, list) else [])
+
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_name = safe_get(item, "name", default="Untitled").replace('|', '_').replace('/', '_')
+                
+                # Extract PDF
+                pdf_file = safe_get(item, "pdfFileName") or safe_get(item, "pdf") or safe_get(item, "fileUrl")
+                if pdf_file:
+                    pdf_url = pdf_file if pdf_file.startswith("http") else f"https://store.adda247.com/{pdf_file}"
+                    file_handle.write(f"{item_name}: {pdf_url}\n")
+                    items_count += 1
+
+                # Extract Video Stream / URL
+                video_url = safe_get(item, "url") or safe_get(item, "videoUrl")
+                if video_url:
+                    file_handle.write(f"{item_name}: {video_url}\n")
+                    items_count += 1
+    return items_count
 
 @app.on_message(filters.command(["start"]))
 async def start_cmd(client, message: Message):
@@ -183,7 +218,6 @@ async def process_credentials(client, message: Message):
 
     packages = safe_get(packages_response, "data", default=[])
     if not packages:
-        # Fallback to v1 endpoint
         v1_packages = await make_request(
             "https://store.adda247.com/api/v1/my/purchase?src=aweb",
             headers=auth_headers
@@ -205,7 +239,7 @@ async def process_credentials(client, message: Message):
                 continue
 
             await status_msg.edit_text(
-                f"🔄 <b>Processing Package</b>\n\n📦 <code>{package_title}</code>",
+                f"🔄 <b>Processing Main Package...</b>\n\n📦 <code>{package_title}</code>",
                 parse_mode=ParseMode.HTML
             )
 
@@ -214,40 +248,10 @@ async def process_credentials(client, message: Message):
             total_items = 0
 
             with open(file_name, "w", encoding='utf-8') as file:
-                # 1. Direct Package Items Scrape
-                direct_endpoints = [
-                    f"https://store.adda247.com/api/v1/my/purchase/OLC/{package_id}?src=aweb",
-                    f"https://store.adda247.com/api/v1/my/purchase/content/{package_id}?src=aweb",
-                    f"https://store.adda247.com/api/v1/my/purchase/test/{package_id}?src=aweb",
-                    f"https://store.adda247.com/api/v1/my/purchase/ebook/{package_id}?src=aweb"
-                ]
+                # Direct items scrape
+                total_items += await scrape_package_items(package_id, auth_headers, file)
 
-                for endp in direct_endpoints:
-                    d_resp = await make_request(endp, headers=auth_headers)
-                    if d_resp:
-                        items = safe_get(d_resp, "data", "onlineClasses", default=[]) or \
-                                safe_get(d_resp, "data", "contents", default=[]) or \
-                                safe_get(d_resp, "data", "tests", default=[]) or \
-                                safe_get(d_resp, "data", default=[])
-                        
-                        if isinstance(items, list):
-                            for item in items:
-                                item_name = safe_get(item, "name", default="Untitled").replace('|', '_').replace('/', '_')
-                                
-                                # Check PDF
-                                pdf_file = safe_get(item, "pdfFileName") or safe_get(item, "pdf") or safe_get(item, "fileUrl")
-                                if pdf_file:
-                                    pdf_url = pdf_file if pdf_file.startswith("http") else f"https://store.adda247.com/{pdf_file}"
-                                    file.write(f"{item_name}: {pdf_url}\n")
-                                    total_items += 1
-
-                                # Check Video
-                                video_url = safe_get(item, "url") or safe_get(item, "videoUrl")
-                                if video_url:
-                                    file.write(f"{item_name}: {video_url}\n")
-                                    total_items += 1
-
-                # 2. Child Packages Scrape (Without Category Filter)
+                # Child packages scrape (Deep Navigation)
                 child_urls = [
                     f"https://store.adda247.com/api/v2/ppc/package/child?packageId={package_id}&pageNumber=0&pageSize=100&src=aweb",
                     f"https://store.adda247.com/api/v1/ppc/package/child?packageId={package_id}&src=aweb"
@@ -264,37 +268,10 @@ async def process_credentials(client, message: Message):
 
                 for child in child_packages:
                     child_id = safe_get(child, "packageId") or safe_get(child, "id")
-                    if not child_id:
-                        continue
+                    if child_id:
+                        total_items += await scrape_package_items(child_id, auth_headers, file)
 
-                    endpoints = [
-                        (f"https://store.adda247.com/api/v1/my/purchase/OLC/{child_id}?src=aweb", "onlineClasses"),
-                        (f"https://store.adda247.com/api/v1/my/purchase/content/{child_id}?src=aweb", "contents"),
-                        (f"https://store.adda247.com/api/v1/my/purchase/test/{child_id}?src=aweb", "tests")
-                    ]
-
-                    for endpoint, content_key in endpoints:
-                        sub_resp = await make_request(endpoint, headers=auth_headers)
-                        if not sub_resp:
-                            continue
-
-                        items = safe_get(sub_resp, "data", content_key, default=[])
-                        if isinstance(items, list):
-                            for item in items:
-                                item_name = safe_get(item, "name", default="Untitled").replace('|', '_').replace('/', '_')
-                                
-                                pdf_file = safe_get(item, "pdfFileName") or safe_get(item, "pdf")
-                                if pdf_file:
-                                    pdf_url = pdf_file if pdf_file.startswith("http") else f"https://store.adda247.com/{pdf_file}"
-                                    file.write(f"{item_name}: {pdf_url}\n")
-                                    total_items += 1
-
-                                video_url = safe_get(item, "url") or safe_get(item, "videoUrl")
-                                if video_url:
-                                    file.write(f"{item_name}: {video_url}\n")
-                                    total_items += 1
-
-            # Upload File
+            # Upload File quietly
             if os.path.exists(file_name) and os.path.getsize(file_name) > 0:
                 elapsed = time.time() - start_time
                 user_mention = message.from_user.mention
@@ -305,7 +282,7 @@ async def process_credentials(client, message: Message):
                     f"⏱ <b>TIME TAKEN:</b> {elapsed:.1f}s\n"
                     f"📅 <b>DATE:</b> {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%d-%m-%Y %H:%M:%S')} IST\n\n"
                     f"📊 <b>CONTENT STATS</b>\n"
-                    f"└─ 📁 Total Items: {total_items}\n\n"
+                    f"└─ 📁 Total Items Extracted: {total_items}\n\n"
                     f"🚀 <b>Extracted by:</b> {user_mention}\n\n"
                     f"<code>╾───• {config.BOT_TEXT} •───╼</code>"
                 )
@@ -330,14 +307,12 @@ async def process_credentials(client, message: Message):
                         logger.error(f"Failed sending to log channel: {log_err}")
 
                 os.remove(file_name)
-            else:
-                await status_msg.reply_text(f"⚠️ <code>{package_title}</code> (ID: {package_id}) mein koi downloadable PDF ya Video links nahi mile.")
 
         except Exception as e:
             logger.error(f"Package Processing Error: {e}")
             continue
 
-    await status_msg.reply_text("✅ <b>Extraction Finished!</b>")
+    await status_msg.edit_text("✅ <b>Extraction Finished!</b> All files have been sent above.")
 
 if __name__ == "__main__":
     print("Bot starting...")
