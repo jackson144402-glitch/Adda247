@@ -29,15 +29,16 @@ THUMB_PATH = "thumb.jpg"
 TIMEOUT = 30
 
 BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Content-Type": "application/json",
     "Origin": "https://www.adda247.com",
     "Referer": "https://www.adda247.com/",
     "X-Auth-Token": "fpoa43edty5",
-    "deviceId": "web_browser_client_pro",
-    "x-app-id": "adda247"
+    "x-app-id": "adda247",
+    "client-id": "adda247",
+    "appVersion": "2.0"
 }
 
 def safe_get(obj, *keys, default=None):
@@ -181,35 +182,35 @@ async def handle_user_input(bot_client, message: Message):
 
             login_data = login_resp.json()
             jwt = safe_get(login_data, "jwtToken") or safe_get(login_data, "data", "jwtToken")
-            user_id = safe_get(login_data, "userId") or safe_get(login_data, "data", "userId")
+            user_id = safe_get(login_data, "userId") or safe_get(login_data, "data", "userId") or safe_get(login_data, "data", "user", "id")
 
             if not jwt:
                 await status_msg.edit_text("❌ <b>Login Failed:</b> JWT Token missing.")
                 del USER_DATA[chat_id]
                 return
 
-            # Injecting cookies & authorization headers into HTTP client session
-            http_client.cookies.set("jwtToken", jwt, domain="adda247.com")
-            http_client.cookies.set("token", jwt, domain="adda247.com")
-            
+            # Comprehensive Header Mapping
             auth_headers = {
-                "X-Jwt-Token": jwt,
-                "x-access-token": jwt,
-                "Authorization": f"Bearer {jwt}",
                 "jwtToken": jwt,
-                "token": jwt
+                "token": jwt,
+                "x-access-token": jwt,
+                "X-Jwt-Token": jwt,
+                "Authorization": f"Bearer {jwt}"
             }
             if user_id:
                 auth_headers["userId"] = str(user_id)
                 auth_headers["x-user-id"] = str(user_id)
-                http_client.cookies.set("userId", str(user_id), domain="adda247.com")
 
             await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching purchased courses...", parse_mode=ParseMode.HTML)
 
             packages = []
+            uid_qs = f"&userId={user_id}" if user_id else ""
+            
             fetch_urls = [
-                "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb",
-                "https://store.adda247.com/api/v1/my/purchase?src=aweb"
+                f"https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb{uid_qs}",
+                f"https://store.adda247.com/api/v1/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb{uid_qs}",
+                f"https://store.adda247.com/api/v2/my/purchase?src=aweb{uid_qs}",
+                f"https://store.adda247.com/api/v1/my/purchase?src=aweb{uid_qs}"
             ]
 
             for url in fetch_urls:
@@ -258,7 +259,6 @@ async def handle_user_input(bot_client, message: Message):
         selected_index = int(message.text) - 1
         packages = user_session.get("packages", [])
         auth_headers = user_session.get("headers", {})
-        jwt = user_session.get("jwt", "")
 
         if selected_index < 0 or selected_index >= len(packages):
             await message.reply_text(f"❌ Invalid Choice! Enter a number between 1 and {len(packages)}.")
@@ -281,9 +281,6 @@ async def handle_user_input(bot_client, message: Message):
         thumb_path = await download_thumbnail()
 
         async with httpx.AsyncClient(headers=BASE_HEADERS, follow_redirects=True, timeout=TIMEOUT) as http_client:
-            http_client.cookies.set("jwtToken", jwt, domain="adda247.com")
-            http_client.cookies.set("token", jwt, domain="adda247.com")
-            
             with open(file_name, "w", encoding='utf-8') as file:
                 total_items += await scrape_package_items(http_client, package_id, auth_headers, file)
 
