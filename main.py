@@ -198,14 +198,14 @@ async def handle_user_input(client, message: Message):
             return
 
         jwt = safe_get(login_response, "jwtToken") or safe_get(login_response, "data", "jwtToken")
-        user_id = safe_get(login_response, "userId") or safe_get(login_response, "data", "userId")
+        user_id = safe_get(login_response, "userId") or safe_get(login_response, "data", "userId") or safe_get(login_response, "user", "id")
 
         if not jwt:
             await status_msg.edit_text("❌ <b>Login Failed:</b> Invalid Credentials.")
             del USER_DATA[chat_id]
             return
 
-        # Correct Auth Header Mapping for Adda247 API
+        # Fixed Header and Auth Mapping
         auth_headers = {
             "X-Jwt-Token": jwt,
             "x-access-token": jwt,
@@ -213,18 +213,21 @@ async def handle_user_input(client, message: Message):
             "jwtToken": jwt,
             "token": jwt
         }
+        
         if user_id:
             auth_headers["userId"] = str(user_id)
             auth_headers["x-user-id"] = str(user_id)
 
         await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching purchased courses...", parse_mode=ParseMode.HTML)
 
-        # Updated Endpoint Sequence
+        # Working Purchased API endpoints with correct params
         packages = []
+        uid_param = f"&userId={user_id}" if user_id else ""
+        
         fetch_urls = [
-            "https://store.adda247.com/api/v3/my/purchase?src=aweb",
-            "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb",
-            "https://store.adda247.com/api/v1/my/purchase?src=aweb"
+            f"https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb{uid_param}",
+            f"https://store.adda247.com/api/v1/my/purchase?src=aweb{uid_param}",
+            f"https://store.adda247.com/api/v2/my/purchase?src=aweb{uid_param}"
         ]
 
         for url in fetch_urls:
@@ -232,6 +235,7 @@ async def handle_user_input(client, message: Message):
             if packages_response:
                 fetched = (
                     safe_get(packages_response, "data", "packages") or 
+                    safe_get(packages_response, "data", "items") or
                     safe_get(packages_response, "data") or 
                     safe_get(packages_response, "packages")
                 )
