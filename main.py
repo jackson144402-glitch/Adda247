@@ -32,6 +32,7 @@ BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
     "Origin": "https://www.adda247.com",
     "Referer": "https://www.adda247.com/",
     "X-Auth-Token": "fpoa43edty5",
@@ -180,20 +181,29 @@ async def handle_user_input(client, message: Message):
 
         email, password = message.text.split("*", 1)
 
-        login_data = {
-            "email": email.strip(),
-            "providerName": "email",
-            "sec": password.strip()
-        }
+        # Updated Login Payloads
+        login_response = None
+        login_data_variants = [
+            {"email": email.strip(), "password": password.strip(), "providerName": "email"},
+            {"email": email.strip(), "sec": password.strip(), "providerName": "email"},
+            {"username": email.strip(), "password": password.strip()}
+        ]
 
-        login_response = await make_request(
+        login_urls = [
             "https://userapi.adda247.com/login?src=aweb",
-            method="POST",
-            json_data=login_data
-        )
+            "https://userapi.adda247.com/v1/login?src=aweb"
+        ]
+
+        for url in login_urls:
+            for payload in login_data_variants:
+                login_response = await make_request(url, method="POST", json_data=payload)
+                if login_response and (safe_get(login_response, "jwtToken") or safe_get(login_response, "data", "jwtToken")):
+                    break
+            if login_response and (safe_get(login_response, "jwtToken") or safe_get(login_response, "data", "jwtToken")):
+                break
 
         if not login_response:
-            await status_msg.edit_text("❌ <b>Login Failed:</b> Server response error.")
+            await status_msg.edit_text("❌ <b>Login Failed:</b> Credentials galat hain ya Server issue hai.")
             del USER_DATA[chat_id]
             return
 
@@ -201,11 +211,10 @@ async def handle_user_input(client, message: Message):
         user_id = safe_get(login_response, "userId") or safe_get(login_response, "data", "userId") or safe_get(login_response, "user", "id")
 
         if not jwt:
-            await status_msg.edit_text("❌ <b>Login Failed:</b> Invalid Credentials.")
+            await status_msg.edit_text("❌ <b>Login Failed:</b> Token receive nahi hua.")
             del USER_DATA[chat_id]
             return
 
-        # Fixed Header and Auth Mapping
         auth_headers = {
             "X-Jwt-Token": jwt,
             "x-access-token": jwt,
@@ -220,14 +229,12 @@ async def handle_user_input(client, message: Message):
 
         await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching purchased courses...", parse_mode=ParseMode.HTML)
 
-        # Working Purchased API endpoints with correct params
         packages = []
         uid_param = f"&userId={user_id}" if user_id else ""
         
         fetch_urls = [
             f"https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb{uid_param}",
-            f"https://store.adda247.com/api/v1/my/purchase?src=aweb{uid_param}",
-            f"https://store.adda247.com/api/v2/my/purchase?src=aweb{uid_param}"
+            f"https://store.adda247.com/api/v1/my/purchase?src=aweb{uid_param}"
         ]
 
         for url in fetch_urls:
