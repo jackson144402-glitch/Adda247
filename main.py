@@ -29,7 +29,7 @@ THUMB_PATH = "thumb.jpg"
 TIMEOUT = 30
 
 BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Content-Type": "application/json",
@@ -37,8 +37,7 @@ BASE_HEADERS = {
     "Referer": "https://www.adda247.com/",
     "X-Auth-Token": "fpoa43edty5",
     "x-app-id": "adda247",
-    "client-id": "adda247",
-    "appVersion": "2.0"
+    "client-id": "adda247"
 }
 
 def safe_get(obj, *keys, default=None):
@@ -155,7 +154,6 @@ async def handle_user_input(bot_client, message: Message):
     if not user_session:
         return
 
-    # STEP 1: Login and List Batches
     if user_session.get("state") == "WAITING_CREDENTIALS":
         if '*' not in message.text:
             await message.reply_text("❌ Invalid format! Please use `email*password` format.")
@@ -189,12 +187,10 @@ async def handle_user_input(bot_client, message: Message):
                 del USER_DATA[chat_id]
                 return
 
-            # Dynamic Headers Mapping
             auth_headers = {
-                "jwtToken": jwt,
                 "token": jwt,
+                "jwtToken": jwt,
                 "x-access-token": jwt,
-                "X-Jwt-Token": jwt,
                 "Authorization": jwt if jwt.startswith("Bearer") else f"Bearer {jwt}"
             }
             if user_id:
@@ -205,35 +201,47 @@ async def handle_user_input(bot_client, message: Message):
 
             packages = []
             
-            # Exact Multi-fallback URLs with Query Params
-            fetch_urls = [
-                f"https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb&token={jwt}",
-                f"https://store.adda247.com/api/v1/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb&token={jwt}",
-                f"https://cp-api.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb&token={jwt}",
-                f"https://cp-api.adda247.com/api/v1/my/purchase?src=aweb&token={jwt}"
-            ]
+            # Post Payload for purchased items
+            post_payload = {
+                "pageNumber": 0,
+                "pageSize": 100
+            }
 
-            if user_id:
-                fetch_urls.append(f"https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=100&src=aweb&userId={user_id}")
+            # Method 1: POST Request to PPC Endpoint
+            try:
+                res = await http_client.post(
+                    "https://store.adda247.com/api/v2/ppc/package/purchased?src=aweb", 
+                    headers=auth_headers,
+                    json=post_payload
+                )
+                if res.status_code == 200:
+                    res_json = res.json()
+                    packages = (
+                        safe_get(res_json, "data", "packages") or 
+                        safe_get(res_json, "data", "items") or 
+                        safe_get(res_json, "data") or []
+                    )
+            except Exception as e:
+                logger.error(f"POST PPC error: {e}")
 
-            for url in fetch_urls:
+            # Method 2: GET Fallback Endpoint without extra params
+            if not packages:
                 try:
-                    res = await http_client.get(url, headers=auth_headers)
+                    res = await http_client.get(
+                        "https://store.adda247.com/api/v1/my/purchase?src=aweb", 
+                        headers=auth_headers
+                    )
                     if res.status_code == 200:
                         res_json = res.json()
-                        fetched = (
+                        packages = (
                             safe_get(res_json, "data", "packages") or 
-                            safe_get(res_json, "data", "items") or
-                            safe_get(res_json, "data") or 
-                            safe_get(res_json, "packages")
+                            safe_get(res_json, "data", "items") or 
+                            safe_get(res_json, "data") or []
                         )
-                        if fetched and isinstance(fetched, list):
-                            packages = fetched
-                            break
                 except Exception as e:
-                    logger.error(f"Error fetching package from {url}: {e}")
+                    logger.error(f"GET Purchase error: {e}")
 
-            if not packages:
+            if not packages or not isinstance(packages, list):
                 await status_msg.edit_text("❌ <b>No Packages Found:</b> Account par koi active batch nahi mila.")
                 del USER_DATA[chat_id]
                 return
@@ -253,7 +261,6 @@ async def handle_user_input(bot_client, message: Message):
             list_text += "\n👇 <b>Reply with the Index Number of the batch (e.g., 1 or 2):</b>"
             await status_msg.edit_text(list_text, parse_mode=ParseMode.HTML)
 
-    # STEP 2: Process Selected Batch Number
     elif user_session.get("state") == "WAITING_BATCH_SELECTION":
         if not message.text.isdigit():
             await message.reply_text("❌ Please enter a valid number from the list above.")
