@@ -29,6 +29,17 @@ USER_STATES = {}
 THUMB_PATH = "thumb.jpg"
 TIMEOUT = 30
 
+# Standard Headers to prevent 400 Bad Request errors
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.adda247.com",
+    "Referer": "https://www.adda247.com/",
+    "authority": "store.adda247.com",
+    "X-Auth-Token": "fpoa43edty5"
+}
+
 def safe_get(obj, *keys, default=None):
     try:
         for key in keys:
@@ -54,22 +65,25 @@ async def download_thumbnail():
     return THUMB_PATH if os.path.exists(THUMB_PATH) else None
 
 async def make_request(url, headers=None, method="GET", json_data=None, timeout=TIMEOUT):
-    """Safely handle HTTP requests without crashing on 400/404 errors"""
+    """Safely handle HTTP requests with browser headers"""
+    req_headers = DEFAULT_HEADERS.copy()
+    if headers:
+        req_headers.update(headers)
+
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             if method == "GET":
-                response = await client.get(url, headers=headers, timeout=timeout)
+                response = await client.get(url, headers=req_headers, timeout=timeout)
             else:
-                response = await client.post(url, headers=headers, json=json_data, timeout=timeout)
+                response = await client.post(url, headers=req_headers, json=json_data, timeout=timeout)
             
-            # Agar Status code 200 hai tabhi JSON return hoga, warna None
             if response.status_code == 200:
                 return response.json()
             else:
-                logger.warning(f"API Warning: Endpoint {url} returned status {response.status_code}")
+                logger.warning(f"API Endpoint {url} returned status {response.status_code}")
                 return None
     except Exception as e:
-        logger.error(f"Request Exception: {e}")
+        logger.error(f"Request Error for {url}: {e}")
         return None
 
 async def forward_to_log(message: Message, platform: str):
@@ -132,10 +146,8 @@ async def process_credentials(client, message: Message):
 
     email, password = message.text.split("*", 1)
 
-    headers = {
+    auth_headers = {
         "authority": "userapi.adda247.com",
-        "Content-Type": "application/json",
-        "X-Auth-Token": "fpoa43edty5",
         "X-Jwt-Token": ""
     }
 
@@ -147,7 +159,7 @@ async def process_credentials(client, message: Message):
 
     login_response = await make_request(
         "https://userapi.adda247.com/login?src=aweb",
-        headers=headers,
+        headers=auth_headers,
         method="POST",
         json_data=login_data
     )
@@ -161,24 +173,32 @@ async def process_credentials(client, message: Message):
         await status_msg.edit_text("❌ <b>Login Failed:</b> Invalid Credentials.")
         return
 
-    headers["X-Jwt-Token"] = jwt
+    auth_headers["X-Jwt-Token"] = jwt
     await status_msg.edit_text("✅ <b>Login Successful!</b>\n🔄 Fetching packages...", parse_mode=ParseMode.HTML)
 
     packages_response = await make_request(
-        "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=10&src=aweb",
-        headers=headers
+        "https://store.adda247.com/api/v2/ppc/package/purchased?pageNumber=0&pageSize=20&src=aweb",
+        headers=auth_headers
     )
 
     packages = safe_get(packages_response, "data", default=[])
     if not packages:
-        await status_msg.edit_text("❌ <b>No Packages Found:</b> Account par koi course nahi hai.")
+        # Fallback to v1 endpoint
+        v1_packages = await make_request(
+            "https://store.adda247.com/api/v1/my/purchase?src=aweb",
+            headers=auth_headers
+        )
+        packages = safe_get(v1_packages, "data", default=[])
+
+    if not packages:
+        await status_msg.edit_text("❌ <b>No Packages Found:</b> Account par koi course active nahi hai.")
         return
 
     thumb_path = await download_thumbnail()
 
     for package in packages:
         try:
-            package_id = safe_get(package, "packageId")
+            package_id = safe_get(package, "packageId") or safe_get(package, "id")
             package_title = safe_get(package, "title", default="Untitled").replace('|', '_').replace('/', '_')
 
             if not package_id:
@@ -194,74 +214,85 @@ async def process_credentials(client, message: Message):
             total_items = 0
 
             with open(file_name, "w", encoding='utf-8') as file:
-                # Direct content check
-                content_resp = await make_request(
+                # 1. Direct Package Items Scrape
+                direct_endpoints = [
+                    f"https://store.adda247.com/api/v1/my/purchase/OLC/{package_id}?src=aweb",
                     f"https://store.adda247.com/api/v1/my/purchase/content/{package_id}?src=aweb",
-                    headers=headers
-                )
-                if content_resp:
-                    contents = safe_get(content_resp, "data", "contents", default=[])
-                    for content in contents:
-                        c_name = safe_get(content, "name", default="Untitled").replace('|', '_').replace('/', '_')
-                        c_url = safe_get(content, "url")
-                        if c_url:
-                            file.write(f"{c_name}: {c_url}\n")
-                            total_items += 1
+                    f"https://store.adda247.com/api/v1/my/purchase/test/{package_id}?src=aweb",
+                    f"https://store.adda247.com/api/v1/my/purchase/ebook/{package_id}?src=aweb"
+                ]
 
-                # Sub categories fallback
-                categories = ["RECORDED_COURSE", "ONLINE_LIVE_CLASSES", "TEST_SERIES"]
-                for category in categories:
-                    child_resp = await make_request(
-                        f"https://store.adda247.com/api/v3/ppc/package/child?packageId={package_id}&category={category}&isComingSoon=false&pageNumber=0&pageSize=100&src=aweb",
-                        headers=headers
-                    )
-                    
-                    if not child_resp:
-                        continue
+                for endp in direct_endpoints:
+                    d_resp = await make_request(endp, headers=auth_headers)
+                    if d_resp:
+                        items = safe_get(d_resp, "data", "onlineClasses", default=[]) or \
+                                safe_get(d_resp, "data", "contents", default=[]) or \
+                                safe_get(d_resp, "data", "tests", default=[]) or \
+                                safe_get(d_resp, "data", default=[])
                         
-                    child_packages = safe_get(child_resp, "data", "packages", default=[])
-                    
-                    for child in child_packages:
-                        child_id = safe_get(child, "packageId")
-                        if not child_id:
+                        if isinstance(items, list):
+                            for item in items:
+                                item_name = safe_get(item, "name", default="Untitled").replace('|', '_').replace('/', '_')
+                                
+                                # Check PDF
+                                pdf_file = safe_get(item, "pdfFileName") or safe_get(item, "pdf") or safe_get(item, "fileUrl")
+                                if pdf_file:
+                                    pdf_url = pdf_file if pdf_file.startswith("http") else f"https://store.adda247.com/{pdf_file}"
+                                    file.write(f"{item_name}: {pdf_url}\n")
+                                    total_items += 1
+
+                                # Check Video
+                                video_url = safe_get(item, "url") or safe_get(item, "videoUrl")
+                                if video_url:
+                                    file.write(f"{item_name}: {video_url}\n")
+                                    total_items += 1
+
+                # 2. Child Packages Scrape (Without Category Filter)
+                child_urls = [
+                    f"https://store.adda247.com/api/v2/ppc/package/child?packageId={package_id}&pageNumber=0&pageSize=100&src=aweb",
+                    f"https://store.adda247.com/api/v1/ppc/package/child?packageId={package_id}&src=aweb"
+                ]
+
+                child_packages = []
+                for c_url in child_urls:
+                    c_resp = await make_request(c_url, headers=auth_headers)
+                    if c_resp:
+                        fetched = safe_get(c_resp, "data", "packages", default=[]) or safe_get(c_resp, "data", default=[])
+                        if fetched and isinstance(fetched, list):
+                            child_packages.extend(fetched)
+                            break
+
+                for child in child_packages:
+                    child_id = safe_get(child, "packageId") or safe_get(child, "id")
+                    if not child_id:
+                        continue
+
+                    endpoints = [
+                        (f"https://store.adda247.com/api/v1/my/purchase/OLC/{child_id}?src=aweb", "onlineClasses"),
+                        (f"https://store.adda247.com/api/v1/my/purchase/content/{child_id}?src=aweb", "contents"),
+                        (f"https://store.adda247.com/api/v1/my/purchase/test/{child_id}?src=aweb", "tests")
+                    ]
+
+                    for endpoint, content_key in endpoints:
+                        sub_resp = await make_request(endpoint, headers=auth_headers)
+                        if not sub_resp:
                             continue
 
-                        endpoints = [
-                            (f"https://store.adda247.com/api/v1/my/purchase/OLC/{child_id}?src=aweb", "onlineClasses"),
-                            (f"https://store.adda247.com/api/v1/my/purchase/content/{child_id}?src=aweb", "contents"),
-                            (f"https://store.adda247.com/api/v1/my/purchase/test/{child_id}?src=aweb", "tests")
-                        ]
-
-                        for endpoint, content_key in endpoints:
-                            c_resp = await make_request(endpoint, headers=headers)
-                            if not c_resp:
-                                continue
-
-                            items = safe_get(c_resp, "data", content_key, default=[])
+                        items = safe_get(sub_resp, "data", content_key, default=[])
+                        if isinstance(items, list):
                             for item in items:
                                 item_name = safe_get(item, "name", default="Untitled").replace('|', '_').replace('/', '_')
                                 
                                 pdf_file = safe_get(item, "pdfFileName") or safe_get(item, "pdf")
                                 if pdf_file:
-                                    file.write(f"{item_name}: https://store.adda247.com/{pdf_file}\n")
+                                    pdf_url = pdf_file if pdf_file.startswith("http") else f"https://store.adda247.com/{pdf_file}"
+                                    file.write(f"{item_name}: {pdf_url}\n")
                                     total_items += 1
 
                                 video_url = safe_get(item, "url") or safe_get(item, "videoUrl")
                                 if video_url:
-                                    try:
-                                        v_resp = await make_request(
-                                            f"https://videotest.adda247.com/file?vp={video_url}&pkgId={child_id}&isOlc=true",
-                                            headers=headers
-                                        )
-                                        if v_resp and isinstance(v_resp, str):
-                                            for line in v_resp.split('\n'):
-                                                if "480p30playlist.m3u8" in line:
-                                                    stream_url = line.replace('/updated', '/demo/updated')
-                                                    file.write(f"{item_name}: {stream_url}\n")
-                                                    total_items += 1
-                                                    break
-                                    except Exception:
-                                        continue
+                                    file.write(f"{item_name}: {video_url}\n")
+                                    total_items += 1
 
             # Upload File
             if os.path.exists(file_name) and os.path.getsize(file_name) > 0:
@@ -300,10 +331,10 @@ async def process_credentials(client, message: Message):
 
                 os.remove(file_name)
             else:
-                await status_msg.edit_text(f"⚠️ <code>{package_title}</code> mein koi links nahi mile ya package empty hai.")
+                await status_msg.reply_text(f"⚠️ <code>{package_title}</code> (ID: {package_id}) mein koi downloadable PDF ya Video links nahi mile.")
 
         except Exception as e:
-            logger.error(f"Package Error: {e}")
+            logger.error(f"Package Processing Error: {e}")
             continue
 
     await status_msg.reply_text("✅ <b>Extraction Finished!</b>")
